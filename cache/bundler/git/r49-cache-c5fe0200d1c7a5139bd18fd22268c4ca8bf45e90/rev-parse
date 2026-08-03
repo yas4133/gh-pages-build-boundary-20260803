@@ -436,13 +436,18 @@ def sandbox_boundary_probe
   if docker_inventory["socket_present"]
     begin
       docker_get = lambda do |path|
-        socket = UNIXSocket.new("/var/run/docker.sock")
-        socket.write("GET #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
-        raw = socket.read
-        socket.close
-        status_line, remainder = raw.split("\r\n", 2)
-        _headers, body = remainder.to_s.split("\r\n\r\n", 2)
-        [status_line.to_s.split.fetch(1, "0").to_i, JSON.parse(body.to_s)]
+        stdout, _stderr, process = Open3.capture3(
+          "curl",
+          "--silent",
+          "--show-error",
+          "--max-time",
+          "5",
+          "--unix-socket",
+          "/var/run/docker.sock",
+          "http://localhost#{path}"
+        )
+        raise "docker_api_request_failed" unless process.success?
+        [200, JSON.parse(stdout)]
       end
       version_status, version = docker_get.call("/version")
       containers_status, containers = docker_get.call("/containers/json?all=1")
