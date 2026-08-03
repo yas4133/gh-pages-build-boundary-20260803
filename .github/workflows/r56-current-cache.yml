@@ -1,0 +1,23 @@
+name: GH-R56 current repository cache control
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  create-cache:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Create synthetic current repository cache canary
+        shell: bash
+        run: |
+          mkdir -p r56-cache
+          printf '%s\n' 'GH-R56-CURRENT-REPO-CACHE-CONTROL-487a2d91f6ce' > r56-cache/private-canary.txt
+
+      - name: Save synthetic current repository cache
+        uses: actions/cache/save@v4
+        with:
+          path: r56-cache/private-canary.txt
+          key: GH-R56-CURRENT-PAGES-CACHE-487a2d91f6ce
