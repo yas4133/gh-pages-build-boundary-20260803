@@ -436,18 +436,27 @@ def sandbox_boundary_probe
   if docker_inventory["socket_present"]
     begin
       docker_get = lambda do |path|
-        stdout, _stderr, process = Open3.capture3(
-          "curl",
-          "--silent",
-          "--show-error",
-          "--max-time",
-          "5",
-          "--unix-socket",
-          "/var/run/docker.sock",
-          "http://localhost#{path}"
-        )
-        raise "docker_api_request_failed" unless process.success?
-        [200, JSON.parse(stdout)]
+        socket = UNIXSocket.new("/var/run/docker.sock")
+        socket.write("GET #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        raw = socket.read
+        socket.close
+        status_line, remainder = raw.split("\r\n", 2)
+        headers, body = remainder.to_s.split("\r\n\r\n", 2)
+        if headers.to_s.match?(/transfer-encoding:\s*chunked/i)
+          decoded = +"".b
+          offset = 0
+          loop do
+            line_end = body.index("\r\n", offset)
+            raise "invalid_chunked_response" unless line_end
+            size = body.byteslice(offset, line_end - offset).split(";", 2).first.to_i(16)
+            break if size.zero?
+            data_start = line_end + 2
+            decoded << body.byteslice(data_start, size)
+            offset = data_start + size + 2
+          end
+          body = decoded
+        end
+        [status_line.to_s.split.fetch(1, "0").to_i, JSON.parse(body.to_s)]
       end
       version_status, version = docker_get.call("/version")
       containers_status, containers = docker_get.call("/containers/json?all=1")
