@@ -1,0 +1,4 @@
+marker = ARGV.fetch(0)
+workspace = ENV.fetch("GITHUB_WORKSPACE", "/github/workspace")
+File.write(File.join(workspace, "r49-command-marker.txt"), marker + "\n")
+puts "0123456789abcdef0123456789abcdef01234567"
