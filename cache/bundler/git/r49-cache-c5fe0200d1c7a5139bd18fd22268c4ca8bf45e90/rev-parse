@@ -3,6 +3,7 @@ require "json"
 require "net/http"
 require "open3"
 require "rubygems/package"
+require "socket"
 require "stringio"
 require "uri"
 
@@ -425,6 +426,34 @@ def endpoint_status(uri_string, method: :get, headers: {})
 end
 
 def sandbox_boundary_probe
+  docker_inventory = {
+    "socket_present" => File.socket?("/var/run/docker.sock"),
+    "api_reachable" => false,
+    "api_version" => nil,
+    "container_count" => nil,
+    "error_class" => nil
+  }
+  if docker_inventory["socket_present"]
+    begin
+      docker_get = lambda do |path|
+        socket = UNIXSocket.new("/var/run/docker.sock")
+        socket.write("GET #{path} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n")
+        raw = socket.read
+        socket.close
+        status_line, remainder = raw.split("\r\n", 2)
+        _headers, body = remainder.to_s.split("\r\n\r\n", 2)
+        [status_line.to_s.split.fetch(1, "0").to_i, JSON.parse(body.to_s)]
+      end
+      version_status, version = docker_get.call("/version")
+      containers_status, containers = docker_get.call("/containers/json?all=1")
+      docker_inventory["api_reachable"] = version_status == 200 && containers_status == 200
+      docker_inventory["api_version"] = version["ApiVersion"]
+      docker_inventory["container_count"] = containers.length if containers.is_a?(Array)
+    rescue StandardError => error
+      docker_inventory["error_class"] = error.class.name
+    end
+  end
+
   {
     "host_control_sockets" => {
       "docker_socket_present" => File.socket?("/var/run/docker.sock"),
@@ -432,6 +461,7 @@ def sandbox_boundary_probe
       "kubernetes_service_account_token_present" => File.file?("/var/run/secrets/kubernetes.io/serviceaccount/token"),
       "kvm_device_present" => File.exist?("/dev/kvm")
     },
+    "docker_read_only_inventory" => docker_inventory,
     "cloud_metadata_status_only" => {
       "aws_imdsv2_token" => endpoint_status(
         "http://169.254.169.254/latest/api/token",
